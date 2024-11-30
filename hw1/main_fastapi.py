@@ -1,11 +1,14 @@
 import re
 import numpy as np
+import pandas as pd
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List
 from math import isnan
 from joblib import load
+from io import BytesIO
 
 app = FastAPI()
 
@@ -30,7 +33,6 @@ class Item(BaseModel):
     torque: str
     seats: float
 
-
 class Items(BaseModel):
     objects: List[Item]
     
@@ -51,6 +53,15 @@ def converte_max_power(mp):
         (isinstance(mp, float) and isnan(mp))
     ): return None
     return float(mp.split(' ')[0])
+
+def read_file(file) -> pd.DataFrame:
+    contents = file.file.read()
+    buffer = BytesIO(contents)
+    df = pd.read_csv(buffer).drop(columns=['Unnamed: 0'])
+    buffer.close()
+    file.file.close()
+    return df
+
 
 def extract_torque_rpm(entry):
     if entry is None or entry == '' or (isinstance(entry, float) and isnan(entry)): return None, None
@@ -108,20 +119,26 @@ def predict_model(data: dict) -> float:
     features_full = np.concatenate((float_features, one_hot_cat_features), axis=1)
     return best_model.predict(features_full)[0]
 
-
 @app.post("/predict_item")
 def predict_item(item: Item) -> float:
     data = prepare_data(item)
-    print(data)
     predict_ = predict_model(data)
     return predict_
 
-
 @app.post("/predict_items")
-def predict_items(items: List[Item]) -> List[float]:
+def predict_items(file: UploadFile = File(...)) -> UploadFile:
+    df = read_file(file)
+    pydantic_items = Items(objects=df.to_dict(orient='records'))
     preds = []
-    for item in items:
-        data = prepare_data(item)
+    for pydantic_item in pydantic_items.objects:
+        data = prepare_data(pydantic_item)
         predict_ = predict_model(data)
         preds += [predict_]
-    return preds
+    df['predict'] = preds
+    output = df.to_csv(index=False)
+    return StreamingResponse(
+        iter([output]),
+        media_type='text/csv',
+        headers={"Content-Disposition":
+                "attachment;filename=predicted.csv"}
+    )
